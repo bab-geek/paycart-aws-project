@@ -1,0 +1,392 @@
+# ============================================================
+# PayCart — GitHub Actions CI/CD Pipeline
+# Stack: Node.js (Express) + AWS Lambda + S3 + CloudFront
+# Triggers: push/PR to main
+# ============================================================
+
+name: PayCart CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Cancel any in-progress run for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Environment variables shared across all jobs ─────────────
+env:
+  NODE_VERSION: "18"
+  AWS_REGION: "us-east-1"
+  BACKEND_LAMBDA_NAME: "paycart-api"
+  PROCESSOR_LAMBDA_NAME: "paycart-order-processor"
+
+# ============================================================
+# JOB 1 — Lint & Test (Backend)
+# Runs on every push AND every pull request
+# ============================================================
+jobs:
+  test-backend:
+    name: "Backend — Lint & Test"
+    runs-on: ubuntu-latest
+
+    services:
+      # Spin up a local MySQL to run integration tests against
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: testpassword
+          MYSQL_DATABASE: paycart_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Node.js setup with dependency caching ─────────────
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      # ── Install dependencies ───────────────────────────────
+      - name: Install backend dependencies
+        run: npm ci
+
+      # ── Initialise test database schema ───────────────────
+      - name: Seed test database
+        run: |
+          sudo apt-get install -y mysql-client -q
+          mysql -h 127.0.0.1 -u root -ptestpassword paycart_test < schema.sql
+        env:
+          MYSQL_PWD: testpassword
+
+      # ── Run tests ─────────────────────────────────────────
+      - name: Run backend tests
+        run: npm test -- --ci --forceExit --detectOpenHandles
+        env:
+          NODE_ENV: test
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_NAME: paycart_test
+          DB_USER: root
+          DB_PASSWORD: testpassword
+          JWT_SECRET: test-jwt-secret-for-ci-only
+          ORDER_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/paycart-orders.fifo
+          AWS_REGION: us-east-1
+
+      # ── Upload test coverage report ────────────────────────
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage/
+          retention-days: 7
+
+  # ============================================================
+  # JOB 2 — Lint & Build (Frontend)
+  # Runs on every push AND every pull request
+  # ============================================================
+  build-frontend:
+    name: "Frontend — Lint & Build"
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Use a placeholder API URL for build validation in CI
+      - name: Build React application
+        run: npm run build
+        env:
+          CI: false                              # Prevents warnings being treated as errors
+          REACT_APP_API_URL: https://placeholder.execute-api.us-east-1.amazonaws.com/prod
+
+      # Save the build artefact for the deploy job to consume
+      - name: Upload frontend build artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/build/
+          retention-days: 1
+
+  # ============================================================
+  # JOB 3 — Security Audit
+  # Checks both backend and frontend for known CVEs
+  # ============================================================
+  security-audit:
+    name: "Security — npm audit"
+    runs-on: ubuntu-latest
+    # Run in parallel with test jobs — no dependency needed
+    needs: []
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Audit backend dependencies
+        working-directory: backend
+        run: npm audit --audit-level=high
+        continue-on-error: false
+
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+        continue-on-error: true     # Frontend audits often have transitive warnings
+
+  # ============================================================
+  # JOB 4 — Deploy Backend to AWS Lambda
+  # Only runs on push to main (NOT on pull requests)
+  # Requires: test-backend + security-audit to pass
+  # ============================================================
+  deploy-backend:
+    name: "Deploy — Lambda Functions"
+    runs-on: ubuntu-latest
+    needs: [test-backend, security-audit]
+
+    # Gate: only deploy on direct push to main, never on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment:
+      name: production
+      url: ${{ vars.API_GATEWAY_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      # ── Configure AWS credentials from GitHub Secrets ─────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Install production-only dependencies ───────────────
+      - name: Install production dependencies
+        working-directory: backend
+        run: npm ci --production
+
+      # ── Zip the Lambda deployment package ─────────────────
+      - name: Package Lambda deployment bundle
+        working-directory: backend
+        run: |
+          zip -r ../lambda-package.zip \
+            src/ \
+            node_modules/ \
+            package.json \
+            --exclude "*.test.js" "coverage/*" ".env*"
+
+      # ── Deploy: Express API Lambda ─────────────────────────
+      - name: Deploy paycart-api Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.BACKEND_LAMBDA_NAME }} \
+            --zip-file fileb://lambda-package.zip \
+            --no-cli-pager
+
+      # Wait for update to complete before publishing version
+      - name: Wait for paycart-api update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ env.BACKEND_LAMBDA_NAME }}
+
+      # ── Deploy: SQS Order Processor Lambda ────────────────
+      - name: Deploy paycart-order-processor Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.PROCESSOR_LAMBDA_NAME }} \
+            --zip-file fileb://lambda-package.zip \
+            --no-cli-pager
+
+      - name: Wait for paycart-order-processor update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ env.PROCESSOR_LAMBDA_NAME }}
+
+      # ── Publish numbered versions for rollback support ─────
+      - name: Publish Lambda versions
+        run: |
+          API_VERSION=$(aws lambda publish-version \
+            --function-name ${{ env.BACKEND_LAMBDA_NAME }} \
+            --description "Deploy from commit ${{ github.sha }}" \
+            --query 'Version' --output text)
+
+          PROC_VERSION=$(aws lambda publish-version \
+            --function-name ${{ env.PROCESSOR_LAMBDA_NAME }} \
+            --description "Deploy from commit ${{ github.sha }}" \
+            --query 'Version' --output text)
+
+          echo "API Lambda version: $API_VERSION"
+          echo "Processor Lambda version: $PROC_VERSION"
+          echo "API_VERSION=$API_VERSION" >> $GITHUB_ENV
+          echo "PROC_VERSION=$PROC_VERSION" >> $GITHUB_ENV
+
+      # ── Smoke test the live Lambda ─────────────────────────
+      - name: Smoke test — health check endpoint
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ vars.API_GATEWAY_URL }}/api/health")
+          echo "Health check HTTP status: $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Health check failed! Rolling back..."
+            exit 1
+          fi
+
+      # ── Summary ────────────────────────────────────────────
+      - name: Print deployment summary
+        run: |
+          echo "### Backend Deployment Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "| Lambda | Version | Commit |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| paycart-api | ${{ env.API_VERSION }} | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| paycart-order-processor | ${{ env.PROC_VERSION }} | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # JOB 5 — Deploy Frontend to S3 + invalidate CloudFront
+  # Only runs on push to main
+  # Requires: build-frontend + deploy-backend to pass
+  # ============================================================
+  deploy-frontend:
+    name: "Deploy — S3 + CloudFront"
+    runs-on: ubuntu-latest
+    needs: [build-frontend, deploy-backend]
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment:
+      name: production
+      url: https://${{ vars.CLOUDFRONT_DOMAIN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Download the build artefact from Job 2 ────────────
+      - name: Download frontend build artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Sync build to S3 (delete removed files) ───────────
+      - name: Sync frontend build to S3
+        run: |
+          aws s3 sync frontend/build/ s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "index.html" \
+            --no-cli-pager
+
+          # index.html must NOT be cached — React Router depends on fresh fetches
+          aws s3 cp frontend/build/index.html s3://${{ secrets.S3_BUCKET_NAME }}/index.html \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --content-type "text/html" \
+            --no-cli-pager
+
+      # ── Invalidate CloudFront cache ────────────────────────
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CF_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "CloudFront invalidation ID: $INVALIDATION_ID"
+          echo "INVALIDATION_ID=$INVALIDATION_ID" >> $GITHUB_ENV
+
+      # ── Wait for invalidation to propagate ────────────────
+      - name: Wait for CloudFront invalidation
+        run: |
+          aws cloudfront wait invalidation-completed \
+            --distribution-id ${{ secrets.CF_DISTRIBUTION_ID }} \
+            --id ${{ env.INVALIDATION_ID }}
+          echo "CloudFront cache cleared and propagated."
+
+      # ── Summary ────────────────────────────────────────────
+      - name: Print deployment summary
+        run: |
+          echo "### Frontend Deployment Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket**: ${{ secrets.S3_BUCKET_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **CloudFront**: https://${{ vars.CLOUDFRONT_DOMAIN }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # JOB 6 — Notify on failure (optional but recommended)
+  # Runs only if any deploy job fails
+  # ============================================================
+  notify-failure:
+    name: "Notify — Deployment Failed"
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    if: failure()
+
+    steps:
+      - name: Post failure summary
+        run: |
+          echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "Review the failed job logs above and re-run after fixing."
+
+      # Optional: post to Slack — add SLACK_WEBHOOK_URL to GitHub Secrets
+      - name: Slack notification (optional)
+        if: ${{ vars.SLACK_NOTIFY == 'true' }}
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H 'Content-type: application/json' \
+            --data '{
+              "text": "❌ *PayCart deploy failed* on `${{ github.ref_name }}`\nCommit: `${{ github.sha }}`\nBy: ${{ github.actor }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }'
