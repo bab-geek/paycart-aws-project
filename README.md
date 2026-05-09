@@ -1,4 +1,4 @@
-# Local Deployment Instructions for the Amazon IVS eCommerce Backend
+# Local Deployment Instructions for the Paycart eCommerce Backend
 
 Deploy a simple serverless stack with API Gateway, Lambda and DynamoDB to store and retrieve product details.
 
