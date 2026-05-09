@@ -1,41 +1,140 @@
-# Amazon IVS eCommerce demo
+# Local Deployment Instructions for the Amazon IVS eCommerce Backend
 
-A demo web application intended as an educational tool for demonstrating how Amazon IVS, in conjunction with other AWS services, can be used to build a compelling customer experience for eCommerce use-cases.
+Deploy a simple serverless stack with API Gateway, Lambda and DynamoDB to store and retrieve product details.
 
-<img src="ecommerce-demo.png" alt="Amazon IVS eCommerce demo" />
+## Prerequisites 
 
-**This project is intended for education purposes only and not for production usage.**
+* Access to AWS Account with permission to create IAM role, DynamoDB, Lambda, API Gateway, S3, and Cloudformation.
+* [AWS CLI Version 2](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html)
+* [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/what-is-sam.html)
 
-This is a serverless web application, leveraging [Amazon IVS](https://aws.amazon.com/ivs/), [AWS Lambda](https://aws.amazon.com/lambda/), [Amazon API Gateway](https://aws.amazon.com/api-gateway/), and [Amazon DynamoDB](https://aws.amazon.com/dynamodb/). The web user interface is a [single page application](https://en.wikipedia.org/wiki/Single-page_application) built using [responsive web design](https://en.wikipedia.org/wiki/Responsive_web_design) frameworks and techniques, producing a native app-like experience tailored to the user's device.
-The demo showcases how customers can load and play an Amazon IVS stream and display browsable product information using TimedMetadata.
-This demo uses a test stream which emits a TimedMetadata event every second with a productId. The productId is then used by the client to highlight the product being shown on stream.
-Product details are stored and retrieved from DynamoDB.
 
-## Getting Started
+## Deploy from your local machine
 
-***IMPORTANT NOTE:** Deploying this demo application in your AWS account will create and consume AWS resources, which will cost money.*
+Before you start, run below command to make sure you're in the correct AWS account and configured.
+```
+aws configure
+```
+For additional help on configuring, please see https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html
 
-To get the demo running in your own AWS account, follow these instructions.
+### 1. Create an S3 bucket
 
-1. If you do not have an AWS account, please see [How do I create and activate a new Amazon Web Services account?](https://aws.amazon.com/premiumsupport/knowledge-center/create-and-activate-aws-account/)
-2. Log into the [AWS console](https://console.aws.amazon.com/) if you are not already. Note: If you are logged in as an IAM user, ensure your account has permissions to create and manage the necessary resources and components for this application.
-3. Follow the instructions for deploying to AWS or running locally.
+* Replace `<my-bucket-name>` with your bucket name.
+* Replace `<my-region>` with your region name.
 
-### Deploying to AWS or running locally
-* This demo is comprised of two parts: `serverless` (the demo backend) and `web-ui` (the demo frontend)
-* To run the demo's backend services locally or on your AWS account, follow the [detailed instructions](./serverless/README.md) to get started.
+```
+aws s3api create-bucket --bucket <my-bucket-name> --region <my-region> \
+--create-bucket-configuration LocationConstraint=<my-region>
+```
 
-## Known issues and limitations
-* The application was written for demonstration purposes and not for production use.
-* Currently only tested in the us-west-2 (Oregon) region. Additional regions may be supported depending on service availability.
+### 2. Pack template with SAM
+```
+sam package \
+--template-file template.yaml \
+--output-template-file packaged.yaml \
+--s3-bucket <my-bucket-name>
+```
+DO NOT run the output from above command, proceed to next step.
 
-## About Amazon IVS
-* Amazon Interactive Video Service (Amazon IVS) is a managed live streaming solution that is quick and easy to set up, and ideal for creating interactive video experiences. [Learn more](https://aws.amazon.com/ivs/).
-* [Amazon IVS docs](https://docs.aws.amazon.com/ivs/)
-* [User Guide](https://docs.aws.amazon.com/ivs/latest/userguide/)
-* [API Reference](https://docs.aws.amazon.com/ivs/latest/APIReference/)
-* [Learn more about Amazon IVS on IVS.rocks](https://ivs.rocks/)
-* [View more demos like this](https://ivs.rocks/examples)
+### 3. Deploy Cloudformation with SAM
 
-## License
-This project is licensed under the MIT-0 License. See the LICENSE file.
+Replace `<my-stack-name>` with your stack name.
+
+Run with default DynamoDB table name `products`:
+```
+sam deploy \
+--template-file packaged.yaml \
+--stack-name <my-stack-name> \
+--capabilities CAPABILITY_IAM
+```
+
+Optional - You can override the default DynamoDB table name by replacing `<my-table-name>` below and run:
+```
+sam deploy \
+--template-file packaged.yaml \
+--stack-name <my-stack-name> \
+--capabilities CAPABILITY_IAM \
+--parameter-overrides TableName=<my-table-name>
+```
+
+On completion, copy the value of `SimpleProductEnpointURL` as you will need it later for your client.
+
+If you run into error with `ROLLBACK_COMPETE` then perform Clean Up > Step 1 and re-run this step.
+
+To retrieve Cloudformation stack outputs again run 
+```
+aws cloudformation describe-stacks --stack-name <my-stack-name> 
+
+aws cloudformation describe-stacks \
+--stack-name <my-stack-name> --query 'Stacks[].Outputs'
+```
+
+### 4. Import sample products
+
+Upload product images to S3 bucket from step 1
+```
+aws s3 cp ./product_images/ s3://<my-bucket-name>/products --recursive --exclude "*" --include "*.jpg"
+```
+
+Add S3 bucket policy to allow public read access to product images.
+Open `s3-policy.json` and replace `<my-bucket-name>` with S3 bucket name from step 1. Save and run command below.
+
+Note, we're allowing only `/<my-bucket-name>/products` folder to be public.
+```
+aws s3api put-bucket-policy --bucket <my-bucket-name> --policy file://s3-policy.json
+```
+
+Verify bucket policy
+```
+aws s3api get-bucket-policy --bucket <my-bucket-name>
+```
+
+Next, open `products.json` file and replace
+
+* `<my-bucket-name>` with bucket name from step 1
+* `<my-region>` with your bucket region
+* Save the file and run the command below to create product details in DynamoDB
+
+If you overrides the default DynamoDB table name then you will need to update line 2; replace `products` with `<my-table-name>`.
+
+```
+aws dynamodb batch-write-item \
+--request-items file://products.json
+```
+
+### 5. Verify data import
+
+If you overrides the default DynamoDB table name then you will need replace `products` with `<my-table-name>`.
+
+```
+aws dynamodb scan --table-name products
+aws dynamodb get-item --table-name products --key '{"id":{"S":"1000567890"}}'
+```
+
+### 6. Verify API Gateway 
+
+Verify product details can be retrieved from DynamoDB. Copy and paste link below into your browser.
+```
+https://url-from-step-3
+https://url-from-step-3?productId=1000567890
+```
+### 7. Deploy eCommerce Web UI Demo
+
+Follow these [detailed instructions](../web-ui) on how to get the web demo running.
+
+## Clean Up
+
+1. Delete Cloudformation stack:
+```
+aws cloudformation delete-stack --stack-name <my-stack-name>
+```
+
+3. Remove files in S3 bucket
+```
+aws s3 rm s3://<my-bucket-name> --recursive
+```
+
+2. Delete S3 bucket
+```
+aws s3api delete-bucket --bucket <my-bucket-name> --region <my-region>
+```
